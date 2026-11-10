@@ -1,0 +1,30 @@
+# nftables mode: the bouncer talks netlink itself, the image has no nft.
+# ${API_URL} and ${API_KEY} are expanded by the bouncer from its environment.
+mode: nftables
+update_frequency: 10s
+log_mode: stdout
+log_level: info
+api_url: ${API_URL}
+api_key: ${API_KEY}
+disable_ipv6: false
+deny_action: DROP
+deny_log: false
+supported_decisions_types:
+  - ban
+blacklists_ipv4: crowdsec-blacklists
+blacklists_ipv6: crowdsec6-blacklists
+nftables:
+  ipv4:
+    enabled: true
+    set-only: false
+    table: crowdsec
+    chain: crowdsec-chain
+    priority: -10
+  ipv6:
+    enabled: true
+    set-only: false
+    table: crowdsec6
+    chain: crowdsec6-chain
+    priority: -10
+nftables_hooks:
+  - input
