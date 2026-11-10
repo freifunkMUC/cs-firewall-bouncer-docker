@@ -32,11 +32,17 @@ grep -qF "$version" <<<"$out" || fail "expected $version, got: $out"
 echo "ok: version $version"
 
 # Without a configuration it must not start.
-if docker run --rm "$image" >/dev/null 2>&1; then fail "starts without a configuration"; fi
+if out=$(docker run --rm "$image" 2>&1); then fail "starts without a configuration"; fi
+grep -qF "unable to read config file" <<<"$out" || fail "unexpected error without a configuration: $out"
 echo "ok: refuses to start without a configuration"
 
 python3 -I "$root/test/fake-lapi.py" "$port" "$key" &
 lapi_pid=$!
+for _ in $(seq 1 20); do
+  kill -0 "$lapi_pid" 2>/dev/null || fail "fake LAPI exited"
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+  sleep 0.5
+done
 
 docker run -d --name "$name" \
   --cap-drop ALL --cap-add NET_ADMIN \
@@ -49,17 +55,25 @@ docker run -d --name "$name" \
 # nft from the alpine image of the build, in the bouncer's network namespace.
 docker run --rm --network "container:$name" --cap-drop ALL --cap-add NET_ADMIN "$helper" sh -euc '
   apk add -q --no-cache nftables >/dev/null
+  # Sets are named after the origin of the decision (cscli in the fake LAPI).
   for _ in $(seq 1 30); do
-    rules=$(nft list ruleset 2>/dev/null || true)
-    if echo "$rules" | grep -qF 192.0.2.1 && echo "$rules" | grep -qF 2001:db8::1; then
-      nft list chain ip crowdsec crowdsec-chain-input | grep -q "drop" || { echo "no drop rule in crowdsec-chain-input"; exit 1; }
+    if nft list set ip crowdsec crowdsec-blacklists-cscli 2>/dev/null | grep -qF 192.0.2.1 &&
+       nft list set ip6 crowdsec6 crowdsec6-blacklists-cscli 2>/dev/null | grep -qF 2001:db8::1; then
+      check() {
+        nft list chain "$1" "$2" "$3" > /tmp/chain
+        grep -qE "type filter hook input priority" /tmp/chain &&
+          grep -qE "^[[:space:]]*$4 saddr @$5 .*drop$" /tmp/chain ||
+          { echo "no input hook or drop rule for @$5:"; cat /tmp/chain; exit 1; }
+      }
+      check ip crowdsec crowdsec-chain-input ip crowdsec-blacklists-cscli
+      check ip6 crowdsec6 crowdsec6-chain-input ip6 crowdsec6-blacklists-cscli
       exit 0
     fi
     sleep 1
   done
-  echo "bans not in the rule set:"; nft list ruleset; exit 1
+  echo "bans not in the sets:"; nft list ruleset; exit 1
 ' || fail "nftables"
-echo "ok: both bans in the nftables sets, drop rule present"
+echo "ok: both bans in the nftables sets, input chains drop them"
 
 [ "$(docker inspect -f '{{.State.Running}}' "$name")" = true ] || fail "bouncer exited"
 echo "smoke test passed"

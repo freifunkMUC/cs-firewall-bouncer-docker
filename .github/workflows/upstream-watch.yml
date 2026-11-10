@@ -40,8 +40,9 @@ jobs:
             --jq '.assets[] | select(.name | test("^crowdsec-firewall-bouncer-linux-(amd64|arm64)\\.tgz$")) | "\(.name) \(.digest)"')
           amd64=$(awk '/amd64/ {sub("sha256:", "", $2); print $2}' <<< "$digests")
           arm64=$(awk '/arm64/ {sub("sha256:", "", $2); print $2}' <<< "$digests")
-          if [ -z "$amd64" ] || [ -z "$arm64" ]; then
-            echo "asset digests missing: $digests" >&2
+          re='^[0-9a-f]{64}$'
+          if ! [[ $amd64 =~ $re && $arm64 =~ $re ]]; then
+            echo "asset digests missing or malformed: $digests" >&2
             exit 1
           fi
           body=$(printf '%s\n' \

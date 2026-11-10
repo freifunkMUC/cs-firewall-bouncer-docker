@@ -105,8 +105,9 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The first unused <version>-rN. Only "not found" means free; any other
-      # error fails rather than overwrite an immutable tag.
+      # The first unused <version>-rN. Only "not found" means free (and, for
+      # -r1, "name unknown"/"denied": GHCR's answer while the package does not
+      # exist yet); any other error fails rather than overwrite a tag.
       - name: Rebuild number
         id: rebuild
         env:
@@ -119,6 +120,8 @@ jobs:
             if out=$(docker buildx imagetools inspect "$IMAGE:$VERSION-r$n" 2>&1); then
               n=$((n + 1))
             elif grep -qiE 'not found|manifest unknown' <<< "$out"; then
+              break
+            elif [ "$n" = 1 ] && grep -qiE 'name unknown|denied' <<< "$out"; then
               break
             else
               echo "Cannot probe $IMAGE:$VERSION-r$n: $out" >&2
