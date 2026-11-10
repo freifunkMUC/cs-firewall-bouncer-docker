@@ -1,0 +1,174 @@
+name: docker
+
+# Pull requests and pushes: build and smoke test. Pushes to main publish if
+# an input of the image changed; a manual run publishes always. Every
+# published image gets a signed build provenance attestation.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      push: ${{ steps.decide.outputs.push }}
+      version: ${{ steps.decide.outputs.version }}
+      base_name: ${{ steps.decide.outputs.base_name }}
+      base_digest: ${{ steps.decide.outputs.base_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          version=$(sed -n 's/^ARG VERSION=//p' Dockerfile)
+          base_ref=$(sed -n 's/^FROM \(gcr\.io[^ ]*\)$/\1/p' Dockerfile)
+          case "$base_ref" in *@sha256:*) ;; *) echo "final FROM is not pinned by digest: $base_ref" >&2; exit 1 ;; esac
+          push=false
+          if [ "$EVENT" = workflow_dispatch ] && [ "$REF_NAME" = main ]; then
+            push=true
+          elif [ "$EVENT" = push ] && [ "$REF_NAME" = main ]; then
+            inputs=(Dockerfile .github/workflows/docker.yml)
+            if [ -z "${BEFORE//0/}" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+               || ! git diff --quiet "$BEFORE" "$GITHUB_SHA" -- "${inputs[@]}"; then
+              push=true
+            else
+              echo "Inputs of the image unchanged: test only, no publish"
+            fi
+          fi
+          {
+            echo "push=$push"
+            echo "version=$version"
+            echo "base_name=${base_ref%@*}"
+            echo "base_digest=${base_ref##*@}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build for the test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: bouncer:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Smoke test
+        run: test/smoke.sh bouncer:test
+
+  publish:
+    needs: build
+    if: needs.build.outputs.push == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    # Two runs probing the same -rN would overwrite each other's tag.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The first unused <version>-rN. Only "not found" means free (and, for
+      # -r1, "name unknown"/"denied": GHCR's answer while the package does not
+      # exist yet); any other error fails rather than overwrite a tag.
+      - name: Rebuild number
+        id: rebuild
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          IMAGE="${IMAGE,,}"
+          n=1
+          while true; do
+            if out=$(docker buildx imagetools inspect "$IMAGE:$VERSION-r$n" 2>&1); then
+              n=$((n + 1))
+            elif grep -qiE 'not found|manifest unknown' <<< "$out"; then
+              break
+            elif [ "$n" = 1 ] && grep -qiE 'name unknown|denied' <<< "$out"; then
+              break
+            else
+              echo "Cannot probe $IMAGE:$VERSION-r$n: $out" >&2
+              exit 1
+            fi
+          done
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # <version> and latest move with every rebuild; <version>-rN and
+          # sha-<commit> stay.
+          tags: |
+            type=raw,value=${{ needs.build.outputs.version }}
+            type=raw,value=${{ needs.build.outputs.version }}-r${{ steps.rebuild.outputs.n }}
+            type=raw,value=latest
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=cs-firewall-bouncer
+            org.opencontainers.image.description=CrowdSec firewall bouncer ${{ needs.build.outputs.version }} (upstream release binary, nftables mode) on distroless
+            org.opencontainers.image.version=${{ needs.build.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.base.name=${{ needs.build.outputs.base_name }}
+            org.opencontainers.image.base.digest=${{ needs.build.outputs.base_digest }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.rebuild.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
