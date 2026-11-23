@@ -1,13 +1,20 @@
 name: docker
 
 # Pull requests and pushes: build and smoke test. Pushes to main publish if
-# an input of the image changed; a manual run publishes always. Every
-# published image gets a signed build provenance attestation.
+# an input of the image changed; a manual run publishes always. A daily run
+# rebuilds without cache and publishes only if the pinned base image changed
+# since the published image was built (distroless has no package manager).
+# Every published image gets BuildKit provenance, an SBOM and a signed build
+# provenance attestation.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Not at minute 0: GitHub delays or drops scheduled runs at the start of
+    # the hour.
+    - cron: "17 4 * * *"
 
 env:
   REGISTRY: ghcr.io
@@ -36,12 +43,35 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           BEFORE: ${{ github.event.before }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         run: |
+          IMAGE="${IMAGE,,}"  # registry names are lowercase
           version=$(sed -n 's/^ARG VERSION=//p' Dockerfile)
           base_ref=$(sed -n 's/^FROM \(gcr\.io[^ ]*\)$/\1/p' Dockerfile)
           case "$base_ref" in *@sha256:*) ;; *) echo "final FROM is not pinned by digest: $base_ref" >&2; exit 1 ;; esac
-          push=false
-          if [ "$EVENT" = workflow_dispatch ] && [ "$REF_NAME" = main ]; then
+          push=false build=true no_cache=false
+          if [ "$EVENT" = schedule ]; then
+            no_cache=true
+            # A failing pull or inspect must not look like "nothing pending".
+            if ! out=$(docker pull --quiet --platform linux/amd64 "$IMAGE:latest" 2>&1); then
+              if grep -qiE 'not found|manifest unknown' <<< "$out"; then
+                echo "Nothing published yet"
+                push=true
+              else
+                echo "Cannot pull $IMAGE:latest: $out" >&2
+                exit 1
+              fi
+            else
+              built_from=$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' "$IMAGE:latest")
+              echo "Base digest: published ${built_from:-none}, Dockerfile ${base_ref##*@}"
+              if [ "$built_from" != "${base_ref##*@}" ]; then
+                push=true
+              else
+                echo "up to date"
+              fi
+            fi
+            [ "$push" = true ] || build=false
+          elif [ "$EVENT" = workflow_dispatch ] && [ "$REF_NAME" = main ]; then
             push=true
           elif [ "$EVENT" = push ] && [ "$REF_NAME" = main ]; then
             inputs=(Dockerfile .github/workflows/docker.yml)
@@ -54,25 +84,33 @@ jobs:
           fi
           {
             echo "push=$push"
+            echo "build=$build"
+            echo "no_cache=$no_cache"
             echo "version=$version"
             echo "base_name=${base_ref%@*}"
             echo "base_digest=${base_ref##*@}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
+        if: steps.decide.outputs.build == 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # A scheduled build ignores the cache; its layers go into the cache for
+      # the publish job.
       - name: Build for the test
+        if: steps.decide.outputs.build == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
           tags: bouncer:test
+          no-cache: ${{ steps.decide.outputs.no_cache == 'true' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
 
       - name: Smoke test
+        if: steps.decide.outputs.build == 'true'
         run: test/smoke.sh bouncer:test
 
   publish:
@@ -164,7 +202,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
+          provenance: mode=max
+          sbom: true
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
