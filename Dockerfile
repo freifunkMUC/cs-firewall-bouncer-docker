@@ -24,7 +24,7 @@ RUN set -eu; \
     tar -xzf /tmp/bouncer.tgz -C /tmp/x; \
     install -m 0755 "/tmp/x/crowdsec-firewall-bouncer-$VERSION/crowdsec-firewall-bouncer" /crowdsec-firewall-bouncer
 
-FROM gcr.io/distroless/static-debian13:latest@sha256:1a64f46364620465ef9e9a8f5413757dfdf22695e050bbfd7303eeaf17a59383
+FROM gcr.io/distroless/static-debian13:latest@sha256:4c2cd1dee442c9a99924a378c7c126fac8fef14771579ef567c3f2bdd7a5122a
 
 COPY --from=fetch /crowdsec-firewall-bouncer /usr/local/bin/crowdsec-firewall-bouncer
 
